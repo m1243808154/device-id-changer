@@ -12,6 +12,7 @@
 
 // 配置文件路径
 #define SETTINGS_SSAID_XML "/data/system/users/0/settings_ssaid.xml"
+#define SETTINGS_SSAID_XML_FMT "/data/system/users/%d/settings_ssaid.xml"
 #define SETTINGS_SECURE_DB "/data/data/com.android.providers.settings/databases/settings.db"
 #define BUILD_PROP "/system/build.prop"
 #define DEFAULT_PROP "/default.prop"
@@ -20,6 +21,12 @@
 #define MAX_PACKAGE_NAME 256
 #define MAX_ID_LENGTH 128
 #define MAX_LINE_LENGTH 1024
+#define MAX_TARGET_USERS 16
+
+typedef struct {
+    int user_id;
+    char uid[32];
+} TargetUser;
 
 // 需要修改的设备标识（仅安全级别）
 typedef struct {
@@ -255,20 +262,65 @@ static int read_package_uid_from_command(const char *cmd, const char *package_na
     return -1;
 }
 
-static int get_package_uid(const char *package_name, char *uid, size_t uid_size) {
+static int get_package_uid_for_user(const char *package_name, int user_id,
+                                    char *uid, size_t uid_size) {
     char cmd[512];
 
-    snprintf(cmd, sizeof(cmd), "cmd package list packages -U %s 2>/dev/null", package_name);
+    snprintf(cmd, sizeof(cmd), "cmd package list packages --user %d -U %s 2>/dev/null",
+             user_id, package_name);
     if (read_package_uid_from_command(cmd, package_name, uid, uid_size) == 0) {
         return 0;
     }
 
-    snprintf(cmd, sizeof(cmd), "pm list packages -U %s 2>/dev/null", package_name);
+    snprintf(cmd, sizeof(cmd), "pm list packages --user %d -U %s 2>/dev/null",
+             user_id, package_name);
     if (read_package_uid_from_command(cmd, package_name, uid, uid_size) == 0) {
         return 0;
     }
 
     return -1;
+}
+
+static int parse_user_id_from_line(const char *line, int *user_id) {
+    const char *start = strstr(line, "UserInfo{");
+    if (!start) {
+        return -1;
+    }
+
+    start += 9;
+    if (!isdigit((unsigned char)*start)) {
+        return -1;
+    }
+
+    *user_id = atoi(start);
+    return 0;
+}
+
+static int get_target_users(const char *package_name, TargetUser *users, int max_users) {
+    char line[512];
+    FILE *fp = popen("pm list users 2>/dev/null", "r");
+    int count = 0;
+
+    if (fp) {
+        while (fgets(line, sizeof(line), fp) && count < max_users) {
+            int user_id;
+            if (parse_user_id_from_line(line, &user_id) == 0 &&
+                get_package_uid_for_user(package_name, user_id,
+                                         users[count].uid, sizeof(users[count].uid)) == 0) {
+                users[count].user_id = user_id;
+                count++;
+            }
+        }
+        pclose(fp);
+    }
+
+    if (count == 0 &&
+        get_package_uid_for_user(package_name, 0, users[0].uid, sizeof(users[0].uid)) == 0) {
+        users[0].user_id = 0;
+        count = 1;
+    }
+
+    return count;
 }
 
 // 生成随机十六进制字符串
@@ -362,9 +414,9 @@ static int is_abx_file(const char *path) {
     return bytes_read >= 3 && magic[0] == 'A' && magic[1] == 'B' && magic[2] == 'X';
 }
 
-static char* read_ssaid_text_file(void) {
-    if (!is_abx_file(SETTINGS_SSAID_XML)) {
-        return read_file(SETTINGS_SSAID_XML);
+static char* read_ssaid_text_file(const char *settings_path) {
+    if (!is_abx_file(settings_path)) {
+        return read_file(settings_path);
     }
 
     char temp_xml[256];
@@ -372,8 +424,8 @@ static char* read_ssaid_text_file(void) {
 
     snprintf(temp_xml, sizeof(temp_xml),
              "/data/local/tmp/settings_ssaid_read_%d.xml", getpid());
-    snprintf(cmd, sizeof(cmd), "abx2xml %s %s",
-             SETTINGS_SSAID_XML, temp_xml);
+    snprintf(cmd, sizeof(cmd), "cat %s | abx2xml - %s",
+             settings_path, temp_xml);
 
     if (run_command(cmd) != 0) {
         fprintf(stderr, "无法将 ABX 配置转换为 XML\n");
@@ -385,28 +437,30 @@ static char* read_ssaid_text_file(void) {
     return content;
 }
 
-static int restore_abx_file(const char *temp_xml, const char *temp_abx) {
+static int restore_abx_file(const char *settings_path, const char *temp_xml, const char *temp_abx) {
     char cmd[512];
 
-    snprintf(cmd, sizeof(cmd), "xml2abx %s %s", temp_xml, temp_abx);
+    snprintf(cmd, sizeof(cmd), "cat %s | xml2abx - %s", temp_xml, temp_abx);
     if (run_command(cmd) != 0) {
         fprintf(stderr, "      ✗ 无法将 XML 转回 ABX\n");
         return -1;
     }
 
-    snprintf(cmd, sizeof(cmd), "cp %s %s", temp_abx, SETTINGS_SSAID_XML);
+    snprintf(cmd, sizeof(cmd), "cat %s > %s", temp_abx, settings_path);
     if (run_command(cmd) != 0) {
         fprintf(stderr, "      ✗ 无法写回 SSAID 配置文件\n");
         return -1;
     }
 
-    run_command("chown system:system " SETTINGS_SSAID_XML);
-    run_command("chmod 600 " SETTINGS_SSAID_XML);
+    snprintf(cmd, sizeof(cmd), "chown system:system %s", settings_path);
+    run_command(cmd);
+    snprintf(cmd, sizeof(cmd), "chmod 600 %s", settings_path);
+    run_command(cmd);
     return 0;
 }
 
 static int modify_ssaid_text_file(const char *settings_path, const char *package_name,
-                                  const char *new_android_id) {
+                                  const char *package_uid, const char *new_android_id) {
     char *content = read_file(settings_path);
     if (!content) {
         fprintf(stderr, "      ✗ 无法读取 SSAID 配置文件\n");
@@ -432,14 +486,6 @@ static int modify_ssaid_text_file(const char *settings_path, const char *package
         // 没有找到，添加新条目
         char *settings_end = strstr(content, "</settings>");
         if (settings_end) {
-            char package_uid[32];
-
-            if (get_package_uid(package_name, package_uid, sizeof(package_uid)) != 0) {
-                free(content);
-                fprintf(stderr, "      ✗ 未找到目标应用 UID，请确认应用已安装: %s\n", package_name);
-                return -1;
-            }
-
             // 计算下一个 ID（查找最大的 id 值）
             int max_id = 0;
             char *id_search = content;
@@ -483,39 +529,76 @@ static int modify_ssaid_text_file(const char *settings_path, const char *package
     return -1;
 }
 
-// 修改 settings_ssaid.xml 中的 Android ID
-int modify_ssaid_xml(const char *package_name, const char *new_android_id) {
-    printf("  [1/2] 修改 Android ID (SSAID)...\n");
-
+static int modify_ssaid_xml_for_user(int user_id, const char *package_name,
+                                     const char *package_uid, const char *new_android_id) {
+    char settings_path[128];
     int result = -1;
 
-    if (is_abx_file(SETTINGS_SSAID_XML)) {
+    snprintf(settings_path, sizeof(settings_path), SETTINGS_SSAID_XML_FMT, user_id);
+
+    if (is_abx_file(settings_path)) {
         char temp_xml[256];
         char temp_abx[256];
         char cmd[512];
 
         snprintf(temp_xml, sizeof(temp_xml),
-                 "/data/local/tmp/settings_ssaid_%d.xml", getpid());
+                 "/data/local/tmp/settings_ssaid_%d_%d.xml", user_id, getpid());
         snprintf(temp_abx, sizeof(temp_abx),
-                 "/data/local/tmp/settings_ssaid_%d.abx", getpid());
-        snprintf(cmd, sizeof(cmd), "abx2xml %s %s",
-                 SETTINGS_SSAID_XML, temp_xml);
+                 "/data/local/tmp/settings_ssaid_%d_%d.abx", user_id, getpid());
+        snprintf(cmd, sizeof(cmd), "cat %s | abx2xml - %s",
+                 settings_path, temp_xml);
 
         if (run_command(cmd) != 0) {
             fprintf(stderr, "      ✗ 无法将 ABX 配置转换为 XML\n");
-        } else if (modify_ssaid_text_file(temp_xml, package_name, new_android_id) == 0 &&
-                   restore_abx_file(temp_xml, temp_abx) == 0) {
+        } else if (modify_ssaid_text_file(temp_xml, package_name, package_uid, new_android_id) == 0 &&
+                   restore_abx_file(settings_path, temp_xml, temp_abx) == 0) {
             result = 0;
         }
 
         remove(temp_xml);
         remove(temp_abx);
     } else {
-        result = modify_ssaid_text_file(SETTINGS_SSAID_XML, package_name, new_android_id);
+        result = modify_ssaid_text_file(settings_path, package_name, package_uid, new_android_id);
+        if (result == 0) {
+            char cmd[256];
+            snprintf(cmd, sizeof(cmd), "chown system:system %s", settings_path);
+            run_command(cmd);
+            snprintf(cmd, sizeof(cmd), "chmod 600 %s", settings_path);
+            run_command(cmd);
+        }
     }
 
+    return result;
+}
+
+// 修改 settings_ssaid.xml 中的 Android ID
+int modify_ssaid_xml(const char *package_name, const char *new_android_id) {
+    printf("  [1/2] 修改 Android ID (SSAID)...\n");
+
+    TargetUser users[MAX_TARGET_USERS];
+    int user_count = get_target_users(package_name, users, MAX_TARGET_USERS);
+    int success_count = 0;
+
+    if (user_count == 0) {
+        fprintf(stderr, "      ✗ 未找到目标应用，请确认应用已安装: %s\n", package_name);
+        return -1;
+    }
+
+    for (int i = 0; i < user_count; i++) {
+        printf("      用户 %d (uid %s): ", users[i].user_id, users[i].uid);
+        if (modify_ssaid_xml_for_user(users[i].user_id, package_name,
+                                      users[i].uid, new_android_id) == 0) {
+            printf("✓\n");
+            success_count++;
+        } else {
+            printf("✗\n");
+        }
+    }
+
+    int result = success_count > 0 ? 0 : -1;
     if (result == 0) {
-        printf("      ✓ Android ID: %s\n", new_android_id);
+        printf("      ✓ Android ID: %s (%d/%d 用户空间)\n",
+               new_android_id, success_count, user_count);
     }
 
     return result;
@@ -575,33 +658,49 @@ int modify_identifiers(const char *package_name, DeviceIdentifiers *ids) {
 }
 
 int force_stop_package(const char *package_name) {
+    TargetUser users[MAX_TARGET_USERS];
+    int user_count = get_target_users(package_name, users, MAX_TARGET_USERS);
     char cmd[512];
+    int success_count = 0;
 
     printf("  [1/2] 强制停止目标应用...\n");
-    snprintf(cmd, sizeof(cmd), "am force-stop %s", package_name);
 
-    if (run_command(cmd) == 0) {
-        printf("      ✓ 已执行: am force-stop %s\n", package_name);
-        return 0;
+    for (int i = 0; i < user_count; i++) {
+        snprintf(cmd, sizeof(cmd), "am force-stop --user %d %s",
+                 users[i].user_id, package_name);
+
+        if (run_command(cmd) == 0) {
+            printf("      ✓ 用户 %d: am force-stop %s\n", users[i].user_id, package_name);
+            success_count++;
+        } else {
+            fprintf(stderr, "      ⚠ 用户 %d: 无法强制停止目标应用\n", users[i].user_id);
+        }
     }
 
-    fprintf(stderr, "      ⚠ 无法强制停止目标应用\n");
-    return -1;
+    return success_count > 0 ? 0 : -1;
 }
 
 int clear_package_data(const char *package_name) {
+    TargetUser users[MAX_TARGET_USERS];
+    int user_count = get_target_users(package_name, users, MAX_TARGET_USERS);
     char cmd[512];
+    int success_count = 0;
 
     printf("  [2/2] 清除目标应用数据...\n");
-    snprintf(cmd, sizeof(cmd), "pm clear %s", package_name);
 
-    if (run_command(cmd) == 0) {
-        printf("      ✓ 已执行: pm clear %s\n", package_name);
-        return 0;
+    for (int i = 0; i < user_count; i++) {
+        snprintf(cmd, sizeof(cmd), "pm clear --user %d %s",
+                 users[i].user_id, package_name);
+
+        if (run_command(cmd) == 0) {
+            printf("      ✓ 用户 %d: pm clear %s\n", users[i].user_id, package_name);
+            success_count++;
+        } else {
+            fprintf(stderr, "      ⚠ 用户 %d: 无法清除目标应用数据\n", users[i].user_id);
+        }
     }
 
-    fprintf(stderr, "      ⚠ 无法清除目标应用数据\n");
-    return -1;
+    return success_count > 0 ? 0 : -1;
 }
 
 void refresh_target_app(const char *package_name, int clear_data) {
@@ -634,9 +733,15 @@ int backup_config(const char *package_name) {
     system(cmd);
     
     // 备份 SSAID
-    snprintf(cmd, sizeof(cmd), "cp %s %s/settings_ssaid.xml 2>/dev/null", 
-             SETTINGS_SSAID_XML, backup_path);
-    system(cmd);
+    TargetUser users[MAX_TARGET_USERS];
+    int user_count = get_target_users(package_name, users, MAX_TARGET_USERS);
+    for (int i = 0; i < user_count; i++) {
+        char settings_path[128];
+        snprintf(settings_path, sizeof(settings_path), SETTINGS_SSAID_XML_FMT, users[i].user_id);
+        snprintf(cmd, sizeof(cmd), "cp %s %s/settings_ssaid_user_%d.xml 2>/dev/null",
+                 settings_path, backup_path, users[i].user_id);
+        system(cmd);
+    }
     
     // 备份系统属性
     snprintf(cmd, sizeof(cmd), "getprop > %s/system_props.txt 2>/dev/null", backup_path);
@@ -652,9 +757,23 @@ void show_current_identifiers(const char *package_name) {
     printf("  当前设备标识信息\n");
     printf("═══════════════════════════════════════\n\n");
     
-    // 显示 Android ID
-    char *content = read_ssaid_text_file();
-    if (content) {
+    TargetUser users[MAX_TARGET_USERS];
+    int user_count = get_target_users(package_name, users, MAX_TARGET_USERS);
+
+    if (user_count == 0) {
+        printf("Android ID (SSAID): 未找到目标应用\n");
+    }
+
+    for (int i = 0; i < user_count; i++) {
+        char settings_path[128];
+        snprintf(settings_path, sizeof(settings_path), SETTINGS_SSAID_XML_FMT, users[i].user_id);
+
+        char *content = read_ssaid_text_file(settings_path);
+        if (!content) {
+            printf("用户 %d Android ID (SSAID): 无法读取\n", users[i].user_id);
+            continue;
+        }
+
         char *entry_start = NULL;
         char *entry_end = NULL;
         char *value_start = NULL;
@@ -672,13 +791,11 @@ void show_current_identifiers(const char *package_name) {
             memcpy(current_id, value_start, len);
             current_id[len] = '\0';
 
-            printf("Android ID (SSAID): %s\n", current_id);
+            printf("用户 %d Android ID (SSAID): %s\n", users[i].user_id, current_id);
         } else {
-            printf("Android ID (SSAID): 未设置\n");
+            printf("用户 %d Android ID (SSAID): 未设置\n", users[i].user_id);
         }
         free(content);
-    } else {
-        printf("Android ID (SSAID): 无法读取\n");
     }
     
     // 显示其他标识
